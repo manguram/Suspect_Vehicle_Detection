@@ -1,0 +1,141 @@
+# ===============================
+# STEP 0: TensorFlow GPU Setup
+# ===============================
+import tensorflow as tf
+
+# Enable dynamic memory allocation (avoids memory over-allocation)
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    print(f"✅ GPU(s) available: {[gpu.name for gpu in gpus]}")
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+else:
+    print("⚠️ No GPU detected. TensorFlow will run on CPU.")
+
+# ===============================
+# STEP 1: Install dependencies
+# ===============================
+!pip install ultralytics tensorflow opencv-python scikit-learn --quiet
+
+# ===============================
+# STEP 2: Upload files
+# ===============================
+from google.colab import files
+
+print("Upload your video file (e.g., video.mp4):")
+video_upload = files.upload()
+
+print("Upload the suspect car image (e.g., suspect.jpg):")
+image_upload = files.upload()
+
+# ===============================
+# STEP 3: Set file paths
+# ===============================
+import os
+
+video_path = next(iter(video_upload))       # Uploaded video filename
+suspect_img_path = next(iter(image_upload)) # Uploaded image filename
+output_dir = './output'
+os.makedirs(output_dir, exist_ok=True)
+
+# ===============================
+# STEP 4: Import required libraries
+# ===============================
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.applications.resnet50 import preprocess_input
+from tensorflow.keras.preprocessing.image import img_to_array
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ===============================
+# STEP 5: Frame extraction (1 FPS)
+# ===============================
+cap = cv2.VideoCapture(video_path)
+fps = cap.get(cv2.CAP_PROP_FPS)
+frame_id = 0
+frames = []
+timestamps = []
+
+print("Extracting 1 frame per second...")
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+    if frame_id % int(fps) == 0:
+        frames.append(frame)
+        timestamps.append(cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0)
+    frame_id += 1
+cap.release()
+print(f"Extracted {len(frames)} frames.")
+
+# ===============================
+# STEP 6: YOLOv8 car detection
+# ===============================
+print("Running YOLOv8 detection...")
+yolo = YOLO("yolov8n.pt")
+car_crops = []
+car_indices = []
+
+for i, frame in enumerate(frames):
+    results = yolo(frame)
+    for r in results:
+        for box in r.boxes:
+            if int(box.cls) == 2:  # class 2 = car
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                crop = frame[y1:y2, x1:x2]
+                car_crops.append(crop)
+                car_indices.append(i)
+
+print(f"Detected {len(car_crops)} cars in total.")
+
+# ===============================
+# STEP 7: Feature extraction (Keras ResNet50)
+# ===============================
+print("Loading ResNet50 for feature extraction...")
+resnet = ResNet50(weights='imagenet', include_top=False, pooling='avg')
+
+def extract_features(image):
+    image = cv2.resize(image, (224, 224))
+    image = img_to_array(image)
+    image = preprocess_input(image)
+    image = np.expand_dims(image, axis=0)
+    return resnet.predict(image)
+
+# Load and encode suspect image
+suspect_img = cv2.imread(suspect_img_path)
+suspect_vec = extract_features(suspect_img)
+
+# ===============================
+# STEP 8: Similarity comparison
+# ===============================
+print("Comparing features...")
+matches = []
+
+for i, car_img in enumerate(car_crops):
+    try:
+        feat = extract_features(car_img)
+        sim = cosine_similarity(suspect_vec, feat)[0][0]
+        if sim > 0.90:
+            matches.append((car_indices[i], sim))
+            out_path = os.path.join(output_dir, f"match_{car_indices[i]}.jpg")
+            cv2.imwrite(out_path, frames[car_indices[i]])
+    except Exception as e:
+        print(f"Error in frame {car_indices[i]}: {e}")
+
+# ===============================
+# STEP 9: Results
+# ===============================
+print("\n--- Matches Found ---")
+for idx, score in matches:
+    print(f"Time: {timestamps[idx]:.2f} sec | Similarity: {score:.2f}")
+
+# ===============================
+# STEP 10: Download matched images
+# ===============================
+import shutil
+shutil.make_archive('matched_output', 'zip', output_dir)
+
+print("\nDownload your results:")
+files.download('matched_output.zip')
